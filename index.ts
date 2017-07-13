@@ -12,6 +12,7 @@ class Locality extends Service {
     super();
     this.id = "a7a1073f-e91f-4c56-8468-f4d6bd1d8c96"; //random id
     this.resources.push(new Locations(this));
+    this.resources.push(new SearchResults(this));
     this.resources.push(new Searches(this));
   }
 }
@@ -114,18 +115,20 @@ class Searches implements Resource {
   private _searches: BehaviorSubject<SearchElement>[] = [];
   private _change: BehaviorSubject<ResourceUpdate>;
   private _logger = rsiLogger.getInstance().getLogger("locality");
-  private geoCoder: GoogleMapsClient;
+  private googleClient: GoogleMapsClient;
+  private searchResultResource: SearchResults;
 
   constructor(private service: Service) {
     this._change = new BehaviorSubject(<ResourceUpdate>{ lastUpdate: Date.now(), action: 'init' });
-    this.geoCoder = createClient({
+    this.googleClient = createClient({
       key: 'AIzaSyDj1SdJs4oAFoxpjKpFWp0GqJisWi7VLbE',
     });
+    this.searchResultResource = <SearchResults>service.getResource("SearchResults");
   }
 
   geocodeAddress(request: google.maps.GeocoderRequest): Promise<google.maps.GeocoderResult[]> {
     return new Promise<google.maps.GeocoderResult[]>((resolve, reject) => {
-      this.geoCoder.geocode(request, (error, response) => {
+      this.googleClient.geocode(request, (error, response) => {
         if (error) {
           reject(error);
         }
@@ -170,17 +173,17 @@ class Searches implements Resource {
 
   updateElement(elementId: string, difference: any): ElementResponse {
     let element = (<BehaviorSubject<SearchElement>>this.getElement(elementId).data);
-    var search: SearchObject = element.getValue().data;
+    var searchObject: SearchObject = element.getValue().data;
     let propertiesChanged: string[] = [];
 
     if (difference.hasOwnProperty("needle")) {
-      search.needle = difference.needle;
+      searchObject.needle = difference.needle;
       propertiesChanged.push("needle");
     }
 
     if (difference.hasOwnProperty("status")) {
       if (-1 !== ["idle", "running", "complete"].indexOf(difference.shuffle)) {
-        search.status = difference.status;
+        searchObject.status = difference.status;
         propertiesChanged.push("status");
       }
     }
@@ -188,9 +191,47 @@ class Searches implements Resource {
     let resp = {
       lastUpdate: Date.now(),
       propertiesChanged: propertiesChanged,
-      data: search
+      data: searchObject
     };
+
     element.next(resp); // @TODO: check diffs bevor updating without a need
+
+    const request: google.maps.GeocoderRequest = {
+      address: searchObject.needle,
+      region: "DE"
+    };
+
+    this.geocodeAddress(request).then((results) => {
+      let search: SearchElement = element.getValue();
+
+      console.log(results);
+
+      for (let entry of results) {
+        let entryId = uuid.v1();
+        let searchResult: SearchResultObject = {
+          id: entryId,
+          name: entry.formatted_address,
+          uri: "/" + this.service.name.toLowerCase() + "/" + this.searchResultResource.name.toLowerCase() + "/" + entryId
+        };
+
+        // add result to resource
+        this.searchResultResource.addElement(searchResult);
+
+        // clear results
+        search.data.results = [];
+
+        // push result to result array of search
+        search.data.results.push(searchResult);
+      }
+
+      element.next(
+        {
+          lastUpdate: Date.now(),
+          propertiesChanged: ["results"],
+          data: search.data
+        });
+    });
+
     return { status: "ok" };
   };
 
@@ -229,7 +270,8 @@ class Searches implements Resource {
     this._change.next({ lastUpdate: Date.now(), action: "add" });
 
     const request: google.maps.GeocoderRequest = {
-      address: state.needle
+      address: state.needle,
+      region: "DE"
     };
 
     this.geocodeAddress(request).then((results) => {
@@ -237,11 +279,17 @@ class Searches implements Resource {
 
       for (let entry of results) {
         let entryId = uuid.v1();
-        search.data.results.push({
+        let searchResult: SearchResultObject = {
           id: entryId,
           name: entry.formatted_address,
-          uri: "/" + this.service.name.toLowerCase() + "/searchresults/" + entryId
-        });
+          uri: "/" + this.service.name.toLowerCase() + "/" + this.searchResultResource.name.toLowerCase() + "/" + entryId
+        };
+
+        // add result to resource
+        this.searchResultResource.addElement(searchResult);
+
+        // push result to result array of search
+        search.data.results.push(searchResult);
       }
 
       newSearch.next(
@@ -265,6 +313,68 @@ class Searches implements Resource {
       return { status: "ok" };
     }
     return { status: "error", code: 404, message: "Element can not be found" };
+  };
+}
+
+interface SearchResultElement extends Element {
+  data: SearchResultObject;
+}
+
+class SearchResults implements Resource {
+  private _name: string;
+  private _searchResults: BehaviorSubject<SearchResultElement>[] = [];
+  private _change: BehaviorSubject<ResourceUpdate>;
+  private _logger = rsiLogger.getInstance().getLogger("locality");
+
+  constructor(private service: Service) {
+    this._change = new BehaviorSubject(<ResourceUpdate>{ lastUpdate: Date.now(), action: 'init' });
+  }
+
+  get name(): string {
+    return this.constructor.name;
+  };
+
+  get elementSubscribable(): Boolean {
+    return true;
+  };
+
+  get change(): BehaviorSubject<ResourceUpdate> {
+    return this._change;
+  }
+
+  getElement(elementId: string): ElementResponse {
+    // find the element requested by the client
+    return {
+      status: "ok",
+      data: this._searchResults.find((element: BehaviorSubject<SearchResultElement>) => {
+        return (<{ id: string }>element.getValue().data).id === elementId;
+      })
+    };
+  };
+
+  getResource(offset?: string | number, limit?: string | number): CollectionResponse {
+    // retriev all element
+    let resp: BehaviorSubject<SearchResultElement>[];
+
+    if ((typeof offset === "number" && typeof limit === "number") || (typeof limit === "number" && !offset) || (typeof offset === "number" && !limit) || (!offset && !limit)) {
+      resp = this._searchResults.slice(<number>offset, <number>limit);
+    }
+
+    return { status: "ok", data: resp };
+  };
+
+  addElement(searchResult: SearchResultObject): void {
+    /** build the actual location and add it to the collections*/
+    let newSearchResult = new BehaviorSubject<SearchResultElement>(
+      {
+        lastUpdate: Date.now(),
+        propertiesChanged: [],
+        data: searchResult
+      });
+    this._searchResults.push(newSearchResult);
+
+    /** publish a resource change */
+    this._change.next({ lastUpdate: Date.now(), action: "add" });
   };
 }
 
